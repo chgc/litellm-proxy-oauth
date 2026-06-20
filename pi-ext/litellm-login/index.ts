@@ -1,17 +1,13 @@
 /**
  * LiteLLM Login — Pi Extension
  *
- * Installation:
- *   cd pi-ext/litellm-login
- *   mkdir -p ~/.pi/agent/extensions/litellm-login
- *   cp -r * ~/.pi/agent/extensions/litellm-login/
- *
  * Usage in Pi:
- *   /login-litellm    ← get JWT and configure LiteLLM provider
- *   /model litellm/deepseek-v4-flash
- *   start coding!
+ *   /login-litellm    ← device flow login (prints URL to console)
+ *   /refresh-models   ← re-fetch model list
+ *   /logout-litellm   ← revoke session key
+ *   /model litellm/flash
  *
- * The proxy URL defaults to http://localhost:4000.
+ * Proxy URL defaults to http://localhost:4000.
  * Override with: export LLM_PROXY_URL=http://my-host:4000
  */
 
@@ -19,12 +15,11 @@ import { readFileSync, writeFileSync, unlinkSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
 
 const PROXY_URL = process.env.LLM_PROXY_URL ?? "http://localhost:4000";
 const STORE_PATH = join(homedir(), ".litellm-jwt");
 
-// ── JWT persistence (for logout) ─────────────────────────────
+// ── JWT persistence ─────────────────────────────────────────
 function storeJwt(jwt: string) {
 	try { writeFileSync(STORE_PATH, jwt, "utf-8"); } catch {}
 }
@@ -51,11 +46,10 @@ async function sleep(ms: number) {
 	return new Promise((r) => setTimeout(r, ms));
 }
 
-// ── Device flow (no pi UI callbacks — they crash in pi 0.79.8) ──
+// ── Device flow ──────────────────────────────────────────────
 async function doDeviceFlow(): Promise<string> {
 	const d = await apiPost("/auth/device", new URLSearchParams({ client_id: "device-flow-client" }));
 
-	// User must open this URL in their browser
 	console.log("\n========================================");
 	console.log("Device Authorization");
 	console.log("  Code:", d.user_code);
@@ -83,33 +77,6 @@ async function doDeviceFlow(): Promise<string> {
 	throw new Error("Timed out");
 }
 
-// ── OAuth login (needed for provider registration) ───────────
-async function login(cb: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-	const jwt = await doDeviceFlow();
-
-	const checkRes = await fetch(`${PROXY_URL}/auth/check`, {
-		headers: { Authorization: `Bearer ${jwt}` },
-	});
-	const check = await checkRes.json();
-	if (!checkRes.ok || !check.authorized) {
-		throw new Error(check.error ?? "No LLM access. Contact admin.");
-	}
-
-	return {
-		access: jwt,
-		refresh: jwt,
-		expires: Date.now() + 55 * 60 * 1000,
-	};
-}
-
-async function refreshToken(cred: OAuthCredentials): Promise<OAuthCredentials> {
-	return {
-		access: cred.refresh,
-		refresh: cred.refresh,
-		expires: Date.now() + 55 * 60 * 1000,
-	};
-}
-
 // ── Fetch models ─────────────────────────────────────────────
 async function fetchModels() {
 	try {
@@ -134,34 +101,29 @@ async function fetchModels() {
 }
 
 // ── Extension ────────────────────────────────────────────────
-function registerProvider(pi: ExtensionAPI, models: any[]) {
+function registerProvider(pi: ExtensionAPI, models: any[], jwt?: string) {
 	try { pi.unregisterProvider("litellm"); } catch {}
 	pi.registerProvider("litellm", {
 		name: "LiteLLM (Keycloak)",
 		baseUrl: PROXY_URL,
 		api: "openai-completions",
+		apiKey: jwt ?? "litellm-proxy",  // After login: JWT → per-user auth
 		models,
-		oauth: {
-			name: "LiteLLM / Keycloak",
-			login,
-			refreshToken,
-			getApiKey: (c: OAuthCredentials) => c.access,
-		},
 	});
 }
 
 export default async function (pi: ExtensionAPI) {
 	const models = await fetchModels();
-	registerProvider(pi, models);
+	const stored = getStoredJwt();
+	registerProvider(pi, models, stored ?? undefined);
 
-	// Fallback command (use /login-litellm if /login crashes)
 	pi.registerCommand("login-litellm", {
 		description: "Login via Keycloak device flow and refresh model list",
-		handler: async (_args, ctx) => {
-			console.log("Starting device authorization…");
+		handler: async () => {
 			const jwt = await doDeviceFlow();
+			storeJwt(jwt);
 
-			console.log("Checking LLM access…");
+			// Check LiteLLM authorization
 			const checkRes = await fetch(`${PROXY_URL}/auth/check`, {
 				headers: { Authorization: `Bearer ${jwt}` },
 			});
@@ -171,21 +133,17 @@ export default async function (pi: ExtensionAPI) {
 				return;
 			}
 
-			// Login successful — store JWT for logout, refresh models
-			storeJwt(jwt);
+			// Register with JWT so all requests use per-user auth
 			console.log("Fetching available models…");
 			const newModels = await fetchModels();
-			registerProvider(pi, newModels);
+			registerProvider(pi, newModels, jwt);
 
 			console.log(`Login successful! Available models (${newModels.length}):`);
-			for (const m of newModels) {
-				console.log(`  - ${m.id}`);
-			}
-			console.log("Use /model litellm/... to select a model.");
+			for (const m of newModels) console.log(`  - ${m.id}`);
+			console.log('Use /model litellm/... to select a model.');
 		},
 	});
 
-	// Logout: block LiteLLM key via proxy /logout
 	pi.registerCommand("logout-litellm", {
 		description: "Logout and revoke LLM access",
 		handler: async () => {
@@ -199,26 +157,27 @@ export default async function (pi: ExtensionAPI) {
 					});
 					const body = await res.json().catch(() => ({}));
 					console.log(body.status === "logged_out" ? "Logged out." : "Logout done.");
-					clearStoredJwt();
 				} else {
 					console.log("No active session found.");
 				}
+				clearStoredJwt();
+				// Reset apiKey to dummy (no valid JWT anymore)
+				const newModels = await fetchModels();
+				registerProvider(pi, newModels);
 			} catch (e: any) {
 				console.log("Logout error:", e.message);
 			}
 		},
 	});
 
-	// Manual model refresh command
 	pi.registerCommand("refresh-models", {
 		description: "Re-fetch model list from LiteLLM",
 		handler: async () => {
 			const newModels = await fetchModels();
-			registerProvider(pi, newModels);
+			const stored = getStoredJwt();
+			registerProvider(pi, newModels, stored ?? undefined);
 			console.log(`Models updated (${newModels.length} available):`);
-			for (const m of newModels) {
-				console.log(`  - ${m.id}`);
-			}
+			for (const m of newModels) console.log(`  - ${m.id}`);
 		},
 	});
 }

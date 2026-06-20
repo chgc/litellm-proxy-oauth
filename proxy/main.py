@@ -223,24 +223,27 @@ async def chat_completions(request: Request):
 
     token = auth.removeprefix("Bearer ")
 
-    # Validate JWT + get/claim per-user LiteLLM key
-    try:
-        claims = validate_jwt(token)
-        user_key = await _ensure_litellm_key(claims)
-    except PermissionError as e:
-        return JSONResponse(status_code=403, content={"error": str(e)})
-    except RuntimeError as e:
-        return JSONResponse(status_code=502, content={"error": str(e)})
+    # If token looks like a JWT (starts with eyJ), validate it
+    if token.startswith("eyJ"):
+        try:
+            claims = validate_jwt(token)
+            user_key = await _ensure_litellm_key(claims)
+        except PermissionError as e:
+            return JSONResponse(status_code=403, content={"error": str(e)})
+        except RuntimeError as e:
+            return JSONResponse(status_code=502, content={"error": str(e)})
+        # Forward using per-user session key
+        body = await request.body()
+        headers = {
+            "Authorization": f"Bearer {user_key}",
+            "Content-Type": "application/json",
+        }
+        async with httpx.AsyncClient(timeout=120) as c:
+            r = await c.post(f"{LITELLM_URL}/v1/chat/completions", content=body, headers=headers)
+            return Response(content=r.content, status_code=r.status_code, media_type="application/json")
 
-    # Forward using the per-user key (not the master key)
-    body = await request.body()
-    headers = {
-        "Authorization": f"Bearer {user_key}",
-        "Content-Type": "application/json",
-    }
-    async with httpx.AsyncClient(timeout=120) as c:
-        r = await c.post(f"{LITELLM_URL}/v1/chat/completions", content=body, headers=headers)
-        return Response(content=r.content, status_code=r.status_code, media_type="application/json")
+    # Non-JWT: not authenticated
+    return JSONResponse(status_code=403, content={"error": "Not authenticated. Run /login-litellm first."})
 
 
 @app.get("/v1/models")
