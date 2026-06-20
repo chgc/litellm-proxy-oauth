@@ -82,7 +82,7 @@ for i in $(seq 1 15); do
   fi
   
   ERROR=$(echo "$TOKEN_RESP" | python -c "import sys,json; print(json.load(sys.stdin).get('error','unknown'))" 2>/dev/null)
-  if [ "$ERROR" = "authorization_pending" ]; then
+  if [ "$ERROR" = "authorization_pending" ] || [ "$ERROR" = "slow_down" ]; then
     echo "    Pending... (poll ${i}/15)"
   else
     echo "    Error: $ERROR"

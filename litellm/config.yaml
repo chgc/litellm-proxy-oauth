@@ -4,7 +4,7 @@
 model_list:
   # ── OpenCode Go Models ─────────────────────────────────
   # Subscribe: https://opencode.ai/auth
-  - model_name: deepseek-v4-flash
+  - model_name: flash
     litellm_params:
       model: openai/deepseek-v4-flash
       api_base: https://opencode.ai/zen/go/v1

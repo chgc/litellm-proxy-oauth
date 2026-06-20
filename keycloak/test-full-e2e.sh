@@ -108,7 +108,7 @@ echo "    Proxy cache before: expect empty"
 LLM_RESP=$(curl -s -w "\n%{http_code}" "${PROXY}/v1/chat/completions" \
   -H "Authorization: Bearer ${JWT}" \
   -H "Content-Type: application/json" \
-  -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}')
+  -d '{"model":"flash","messages":[{"role":"user","content":"hi"}]}')
 LLM_CODE=$(echo "$LLM_RESP" | tail -1)
 LLM_BODY=$(echo "$LLM_RESP" | head -n -1)
 
@@ -133,7 +133,7 @@ if [ -n "$CHOICE" ]; then
   echo "|  LiteLLM forward    ✅                                   |"
   echo "|  LLM response       ✅                                   |"
   echo "+==========================================================+"
-  echo "|  Model: deepseek-v4-flash                                |"
+  echo "|  Model: flash                                |"
   echo "|  Response: ${CHOICE:0:100}                                |"
   echo "+==========================================================+"
 elif echo "$LLM_BODY" | grep -qi "api.key\|api_key"; then
