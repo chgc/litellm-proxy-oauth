@@ -1,0 +1,23 @@
+# LiteLLM Proxy Configuration
+# Uses Keycloak JWT access tokens as API keys (no static API key needed)
+
+model_list:
+  # ── OpenCode Go Models ─────────────────────────────────
+  # Subscribe: https://opencode.ai/auth
+  - model_name: deepseek-v4-flash
+    litellm_params:
+      model: openai/deepseek-v4-flash
+      api_base: https://opencode.ai/zen/go/v1
+      api_key: os.environ/OPENCODE_GO_API_KEY
+
+litellm_settings:
+  drop_params: true
+  set_verbose: false
+  cache: false
+
+general_settings:
+  # Master key for admin endpoints (for /key/generate etc.)
+  master_key: sk-litellm-master-key-change-me
+
+  # PostgreSQL database (set via DATABASE_URL env var)
+  database_url: os.environ/DATABASE_URL

@@ -1,0 +1,64 @@
+{
+  "realm": "device-flow",
+  "displayName": "Device Flow Demo Realm",
+  "displayNameHtml": "<h2>Device Flow Demo (RFC 8628)</h2>",
+  "enabled": true,
+  "registrationAllowed": false,
+  "loginWithEmailAllowed": true,
+  "resetPasswordAllowed": false,
+  "accessTokenLifespan": 3600,
+  "ssoSessionMaxLifespan": 36000,
+  "sslRequired": "none",
+
+  "users": [
+    {
+      "username": "testuser",
+      "enabled": true,
+      "email": "testuser@example.com",
+      "firstName": "Test",
+      "lastName": "User",
+      "emailVerified": true,
+      "credentials": [
+        {
+          "type": "password",
+          "value": "testpass",
+          "temporary": false
+        }
+      ],
+      "realmRoles": ["default-roles-device-flow"]
+    }
+  ],
+
+  "roles": {
+    "realm": [
+      {
+        "name": "user",
+        "description": "Regular user"
+      }
+    ]
+  },
+
+  "clients": [
+    {
+      "clientId": "device-flow-client",
+      "enabled": true,
+      "publicClient": true,
+      "protocol": "openid-connect",
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "authorizationServicesEnabled": false,
+      "attributes": {
+        "oauth2.device.authorization.grant.enabled": "true"
+      },
+      "redirectUris": [],
+      "webOrigins": [],
+      "baseUrl": "",
+      "adminUrl": ""
+    }
+  ],
+
+  "requiredActions": [],
+  "defaultSignatureAlgorithm": "RS256"
+}

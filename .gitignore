@@ -1,0 +1,30 @@
+# ── Go ──
+*.exe
+*.exe~
+*.test
+*.out
+*.obj
+*.lib
+*.dll
+*.so
+*.dylib
+
+# ── OS ──
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# ── IDE ──
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.env
+
+# ── Docker ──
+nul
+
+# ── Temp / Logs ──
+*.log
+/tmp/

@@ -1,0 +1,131 @@
+# ────────────────────────────────────────────────────────────────
+#  One URL to rule them all
+# ────────────────────────────────────────────────────────────────
+#
+#  The client (pi extension) only needs to know:
+#    http://localhost:4000
+#
+#  Everything else is internal:
+#    /auth/device              → Keycloak device auth
+#    /auth/token               → Keycloak token polling
+#    /v1/chat/completions      → validate JWT → LiteLLM
+#
+#  Start:
+#    docker compose up -d --build
+#
+#  Then in pi:
+#    /login litellm
+#
+# ────────────────────────────────────────────────────────────────
+
+services:
+  # ── Keycloak ────────────────────────────────────────────────
+  # Issues JWTs. Port 8080 needed for browser redirect.
+  keycloak:
+    image: quay.io/keycloak/keycloak:24.0
+    ports:
+      - "8080:8080"
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+      KC_HOSTNAME: localhost
+      KC_HOSTNAME_PORT: 8080
+      KC_HOSTNAME_STRICT: "false"
+    volumes:
+      - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json:ro
+    command:
+      - "start-dev"
+      - "--import-realm"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'cat < /dev/null > /dev/tcp/127.0.0.1/8080'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+    networks:
+      - llm-net
+
+  # ── PostgreSQL ──────────────────────────────────────────────
+  # For LiteLLM key management.
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: litellm
+      POSTGRES_PASSWORD: litellm
+      POSTGRES_DB: litellm
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U litellm -d litellm"]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+    networks:
+      - llm-net
+
+  # ── LiteLLM ─────────────────────────────────────────────────
+  # Admin API for user / key management.
+  litellm:
+    image: ghcr.io/berriai/litellm:latest
+    ports:
+      - "4001:4000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://litellm:litellm@postgres:5432/litellm?sslmode=disable
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      OPENCODE_GO_API_KEY: "${OPENCODE_GO_API_KEY:-}"
+    volumes:
+      - ./litellm/config.yaml:/app/config.yaml:ro
+    command:
+      - "--config"
+      - "/app/config.yaml"
+      - "--port"
+      - "4000"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'cat < /dev/null > /dev/tcp/127.0.0.1/4000'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks:
+      - llm-net
+
+  # ── Auth / LLM Proxy ────────────────────────────────────────
+  # One URL for the client. Validates JWTs, proxies to Keycloak + LiteLLM.
+  proxy:
+    build: ./proxy
+    ports:
+      - "4000:4000"
+    depends_on:
+      keycloak:
+        condition: service_healthy
+      litellm:
+        condition: service_healthy
+    environment:
+      KC_URL: http://keycloak:8080
+      KC_REALM: device-flow
+      KC_ISSUER: http://localhost:8080/realms/device-flow
+      LITELLM_URL: http://litellm:4000
+      LITELLM_MASTER_KEY: sk-litellm-master-key-change-me
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'cat < /dev/null > /dev/tcp/127.0.0.1/4000'"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    networks:
+      - llm-net
+
+volumes:
+  postgres-data:
+
+networks:
+  llm-net:
+    name: llm-network
+    driver: bridge
