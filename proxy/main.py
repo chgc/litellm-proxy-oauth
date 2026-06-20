@@ -99,7 +99,7 @@ async def _ensure_litellm_key(claims: dict) -> str:
             headers={"Authorization": f"Bearer {LITELLM_MASTER_KEY}", "Content-Type": "application/json"},
             json={
                 "key_alias": f"session-{uuid.uuid4().hex[:8]}",
-                "user_id": user_sub,
+                "user_id": username,
                 "max_budget": None,
             },
         )

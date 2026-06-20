@@ -2,10 +2,9 @@
  * LiteLLM Login — Pi Extension
  *
  * Usage in Pi:
- *   /login-litellm    ← device flow login (prints URL to console)
- *   /refresh-models   ← re-fetch model list
+ *   /login-litellm    ← device flow login
  *   /logout-litellm   ← revoke session key
- *   /model litellm/flash
+ *   /refresh-models   ← re-fetch model list
  *
  * Proxy URL defaults to http://localhost:4000.
  * Override with: export LLM_PROXY_URL=http://my-host:4000
@@ -14,7 +13,7 @@
 import { readFileSync, writeFileSync, unlinkSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 
 const PROXY_URL = process.env.LLM_PROXY_URL ?? "http://localhost:4000";
 const STORE_PATH = join(homedir(), ".litellm-jwt");
@@ -47,25 +46,39 @@ async function sleep(ms: number) {
 }
 
 // ── Device flow ──────────────────────────────────────────────
-async function doDeviceFlow(): Promise<string> {
+async function doDeviceFlow(ctx: ExtensionCommandContext): Promise<string> {
 	const d = await apiPost("/auth/device", new URLSearchParams({ client_id: "device-flow-client" }));
 
-	console.log("\n========================================");
-	console.log("Device Authorization");
-	console.log("  Code:", d.user_code);
-	console.log("  URL: ", d.verification_uri_complete);
-	console.log("========================================\n");
+	ctx.ui.setWidget("litellm-login", [
+		"╭─ Device Authorization ─────────────────────╮",
+		`│  Code: ${String(d.user_code).padEnd(37)}│`,
+		`│  URL:                                       │`,
+		`│  ${String(d.verification_uri_complete).padEnd(43)}│`,
+		"╰──────────────────────────────────────────────╯",
+	]);
 
 	const deadline = Date.now() + 5 * 60 * 1000;
+	let pollCount = 0;
 	while (Date.now() < deadline) {
 		await sleep((d.interval ?? 5) * 1000);
+		pollCount++;
+		ctx.ui.setWidget("litellm-login", [
+			"╭─ Device Authorization ─────────────────────╮",
+			`│  Code: ${String(d.user_code).padEnd(37)}│`,
+			`│  URL:                                       │`,
+			`│  ${String(d.verification_uri_complete).padEnd(43)}│`,
+			`│  Waiting… (poll ${pollCount})${new Array(25).fill(" ").join("")}│`,
+			"╰──────────────────────────────────────────────╯",
+		]);
 		try {
 			const t = await apiPost("/auth/token", new URLSearchParams({
 				grant_type: "urn:ietf:params:oauth:grant-type:device_code",
 				device_code: d.device_code,
 				client_id: "device-flow-client",
 			}));
-			if (t.access_token) return t.access_token;
+			if (t.access_token) {
+				return t.access_token;
+			}
 		} catch (e: any) {
 			if (e.message?.includes("authorization_pending")) continue;
 			if (e.message?.includes("access_denied")) throw new Error("Denied by user");
@@ -100,14 +113,14 @@ async function fetchModels() {
 	}
 }
 
-// ── Extension ────────────────────────────────────────────────
+// ── Provider registration ────────────────────────────────────
 function registerProvider(pi: ExtensionAPI, models: any[], jwt?: string) {
 	try { pi.unregisterProvider("litellm"); } catch {}
 	pi.registerProvider("litellm", {
 		name: "LiteLLM (Keycloak)",
 		baseUrl: PROXY_URL,
 		api: "openai-completions",
-		apiKey: jwt ?? "litellm-proxy",  // After login: JWT → per-user auth
+		apiKey: jwt ?? "litellm-proxy",
 		models,
 	});
 }
@@ -118,36 +131,52 @@ export default async function (pi: ExtensionAPI) {
 	registerProvider(pi, models, stored ?? undefined);
 
 	pi.registerCommand("login-litellm", {
-		description: "Login via Keycloak device flow and refresh model list",
-		handler: async () => {
-			const jwt = await doDeviceFlow();
-			storeJwt(jwt);
+		description: "Login via Keycloak device flow",
+		handler: async (_args, ctx) => {
+			try {
+				const jwt = await doDeviceFlow(ctx);
+				storeJwt(jwt);
 
-			// Check LiteLLM authorization
-			const checkRes = await fetch(`${PROXY_URL}/auth/check`, {
-				headers: { Authorization: `Bearer ${jwt}` },
-			});
-			const check = await checkRes.json();
-			if (!checkRes.ok || !check.authorized) {
-				console.log("Access denied:", check.error);
-				return;
+				// Check authorization
+				const checkRes = await fetch(`${PROXY_URL}/auth/check`, {
+					headers: { Authorization: `Bearer ${jwt}` },
+				});
+				const check = await checkRes.json();
+				if (!checkRes.ok || !check.authorized) {
+					ctx.ui.setWidget("litellm-login", [
+						`Access denied: ${check.error}`,
+						"Contact your admin to provision an LLM key.",
+					]);
+					ctx.ui.notify(`Access denied: ${check.error}`, "error");
+					clearStoredJwt();
+					return;
+				}
+
+				// Re-register with JWT
+				ctx.ui.setStatus("litellm", "Loading models…");
+				const newModels = await fetchModels();
+				registerProvider(pi, newModels, jwt);
+				ctx.ui.setStatus("litellm", undefined);
+
+				const modelList = newModels.map((m) => `  - ${m.id}`).join("\n");
+				ctx.ui.setWidget("litellm-login", [
+					"Login successful! Available models:",
+					modelList,
+					'Use /model litellm/... to select.',
+				]);
+			} catch (e: any) {
+				const msg = String(e.message || e);
+				ctx.ui.setWidget("litellm-login", [`Error: ${msg}`]);
+				ctx.ui.notify(msg, "error");
 			}
-
-			// Register with JWT so all requests use per-user auth
-			console.log("Fetching available models…");
-			const newModels = await fetchModels();
-			registerProvider(pi, newModels, jwt);
-
-			console.log(`Login successful! Available models (${newModels.length}):`);
-			for (const m of newModels) console.log(`  - ${m.id}`);
-			console.log('Use /model litellm/... to select a model.');
 		},
 	});
 
 	pi.registerCommand("logout-litellm", {
 		description: "Logout and revoke LLM access",
-		handler: async () => {
-			console.log("Logging out…");
+		handler: async (_args, ctx) => {
+			ctx.ui.setStatus("litellm", "Logging out…");
+			let isError = false;
 			try {
 				const jwt = getStoredJwt();
 				if (jwt) {
@@ -156,28 +185,43 @@ export default async function (pi: ExtensionAPI) {
 						method: "POST",
 					});
 					const body = await res.json().catch(() => ({}));
-					console.log(body.status === "logged_out" ? "Logged out." : "Logout done.");
+					if (body.status === "logged_out") {
+						ctx.ui.notify("Logged out.", "info");
+					} else {
+						ctx.ui.notify("Session ended.", "info");
+					}
 				} else {
-					console.log("No active session found.");
+					ctx.ui.notify("No active session.", "info");
 				}
+			} catch (e: any) {
+				isError = true;
+				const msg = String(e.message || e);
+				ctx.ui.setWidget("litellm-login", [`Logout error: ${msg}`]);
+				ctx.ui.notify(`Logout: ${msg}`, "error");
+			} finally {
 				clearStoredJwt();
-				// Reset apiKey to dummy (no valid JWT anymore)
 				const newModels = await fetchModels();
 				registerProvider(pi, newModels);
-			} catch (e: any) {
-				console.log("Logout error:", e.message);
+				if (!isError) {
+					ctx.ui.setWidget("litellm-login", undefined);
+				}
+				ctx.ui.setStatus("litellm", undefined);
 			}
 		},
 	});
 
 	pi.registerCommand("refresh-models", {
 		description: "Re-fetch model list from LiteLLM",
-		handler: async () => {
+		handler: async (_args, ctx) => {
+			ctx.ui.setStatus("litellm", "Refreshing models…");
 			const newModels = await fetchModels();
 			const stored = getStoredJwt();
 			registerProvider(pi, newModels, stored ?? undefined);
-			console.log(`Models updated (${newModels.length} available):`);
-			for (const m of newModels) console.log(`  - ${m.id}`);
+			ctx.ui.setStatus("litellm", undefined);
+			ctx.ui.setWidget("litellm-login", [
+				`Models updated (${newModels.length} available):`,
+				...newModels.map((m) => `  - ${m.id}`),
+			]);
 		},
 	});
 }
