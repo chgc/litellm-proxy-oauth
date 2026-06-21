@@ -21,15 +21,49 @@ const PROXY_URL = process.env.LLM_PROXY_URL ?? "http://localhost:4000";
 const CLIENT_ID = "device-flow-client";
 const AUTH = AuthStorage.create();
 
-// ── Keycloak OAuth provider (for auto-refresh) ──────────────
+// ── Keycloak OAuth provider (for auto-refresh & /login flow) ──
 const keycloakOAuthProvider: OAuthProviderInterface = {
 	id: "litellm",
 	name: "LiteLLM (Keycloak)",
 
-	// login is handled manually via /login-litellm command
-	// (we do our own device flow UI with custom box art)
-	async login() {
-		throw new Error("Use /login-litellm command instead of /login litellm");
+	async login(callbacks) {
+		const d = await apiPost("/auth/device", new URLSearchParams({ client_id: CLIENT_ID }));
+
+		callbacks.onDeviceCode({
+			userCode: d.user_code,
+			verificationUri: d.verification_uri_complete ?? d.verification_uri,
+			intervalSeconds: d.interval ?? 5,
+			expiresInSeconds: d.expires_in ?? 300,
+		});
+
+		const deadline = Date.now() + ((d.expires_in ?? 300) * 1000);
+		let pollCount = 0;
+		while (Date.now() < deadline) {
+			await sleep((d.interval ?? 5) * 1000);
+			pollCount++;
+			callbacks.onProgress?.(`Waiting for authorization (poll ${pollCount})…`);
+			try {
+				const t = await apiPost("/auth/token", new URLSearchParams({
+					grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+					device_code: d.device_code,
+					client_id: CLIENT_ID,
+				}));
+				if (t.access_token) {
+					return {
+						refresh: t.refresh_token,
+						access: t.access_token,
+						expires: Date.now() + (t.expires_in ?? 3600) * 1000,
+					};
+				}
+			} catch (e: any) {
+				if (e.message?.includes("authorization_pending")) continue;
+				if (e.message?.includes("access_denied")) throw new Error("Denied by user");
+				if (e.message?.includes("expired_token") || e.message?.includes("invalid_grant")) {
+					throw new Error("Expired. Run /login-litellm again.");
+				}
+			}
+		}
+		throw new Error("Timed out");
 	},
 
 	async refreshToken(credentials) {
