@@ -2,7 +2,7 @@
  * LiteLLM Login — Pi Extension
  *
  * Usage in Pi:
- *   /login litellm      ← OAuth device flow (via pi's built-in /login)
+ *   /login litellm      ← OAuth device flow + auto provider activation
  *   /logout litellm     ← clears auth.json credentials (built-in)
  *
  * Proxy URL defaults to http://localhost:4000.
@@ -13,19 +13,17 @@
  * AuthStorage auto-refreshes the JWT when it nears expiry.
  */
 
-import { AuthStorage, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { registerOAuthProvider, type OAuthProviderInterface } from "@earendil-works/pi-ai/oauth";
+import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { registerOAuthProvider, type OAuthLoginCallbacks, type OAuthProviderInterface } from "@earendil-works/pi-ai/oauth";
 
 const PROXY_URL = process.env.LLM_PROXY_URL ?? "http://localhost:4000";
 const CLIENT_ID = "device-flow-client";
-const AUTH = AuthStorage.create();
 
-// ── Keycloak OAuth provider (for auto-refresh & /login flow) ──
-const keycloakOAuthProvider: OAuthProviderInterface = {
+// ── OAuth login / refresh / key resolution ───────────────────
+const litellmLogin: OAuthProviderInterface = {
 	id: "litellm",
-	name: "LiteLLM (Keycloak)",
-
-	async login(callbacks) {
+	name: "LiteLLM (Keycloak)" as const,
+	async login(callbacks: OAuthLoginCallbacks) {
 		const d = await apiPost("/auth/device", new URLSearchParams({ client_id: CLIENT_ID }));
 
 		callbacks.onDeviceCode({
@@ -65,7 +63,7 @@ const keycloakOAuthProvider: OAuthProviderInterface = {
 		throw new Error("Timed out");
 	},
 
-	async refreshToken(credentials) {
+	async refreshToken(credentials: { refresh: string }) {
 		const res = await fetch(`${PROXY_URL}/auth/token`, {
 			method: "POST",
 			headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -87,20 +85,10 @@ const keycloakOAuthProvider: OAuthProviderInterface = {
 		};
 	},
 
-	getApiKey(credentials) {
+	getApiKey(credentials: { access: string }) {
 		return credentials.access;
 	},
 };
-
-registerOAuthProvider(keycloakOAuthProvider);
-
-// ── JWT access (via AuthStorage, auto-refreshes OAuth tokens) ──
-/** Read stored JWT from auth.json, auto-refreshing if expired. */
-async function getStoredJwt(): Promise<string | null> {
-	try {
-		return await AUTH.getApiKey("litellm") ?? null;
-	} catch { return null; }
-}
 
 // ── Helpers ──────────────────────────────────────────────────
 async function apiPost(path: string, body: URLSearchParams) {
@@ -141,35 +129,36 @@ async function fetchModels() {
 	}
 }
 
-// ── Provider registration ────────────────────────────────────
-function registerProvider(pi: ExtensionAPI, models: any[], jwt?: string) {
-	try { pi.unregisterProvider("litellm"); } catch {}
+export default async function (pi: ExtensionAPI) {
+	const models = await fetchModels();
+
+	// Register the OAuth provider directly to bypass the
+	// { ...config.oauth } spread in applyProviderConfig. This
+	// ensures name/id are never lost regardless of model registry
+	// refresh timing.
+	registerOAuthProvider({
+		id: "litellm",
+		name: "LiteLLM (Keycloak)",
+		async login(callbacks) {
+			return litellmLogin.login(callbacks);
+		},
+		async refreshToken(credentials) {
+			return litellmLogin.refreshToken(credentials);
+		},
+		getApiKey(credentials) {
+			return litellmLogin.getApiKey(credentials);
+		},
+	});
+
 	pi.registerProvider("litellm", {
 		name: "LiteLLM (Keycloak)",
 		baseUrl: PROXY_URL,
 		api: "openai-completions",
-		apiKey: jwt ?? "litellm-proxy",
+		// Fallback when user hasn't logged in yet
+		apiKey: "litellm-proxy",
 		models,
-	});
-}
-
-export default async function (pi: ExtensionAPI) {
-	const models = await fetchModels();
-	const stored = await getStoredJwt();
-	registerProvider(pi, models, stored ?? undefined);
-
-	// Re-register provider with fresh JWT on session start.
-	// This picks up credentials stored by /login litellm.
-	pi.on("session_start", async (_event, ctx) => {
-		const jwt = await getStoredJwt();
-		if (jwt) {
-			const newModels = await fetchModels();
-			registerProvider(pi, newModels, jwt);
-			ctx.ui.setWidget("litellm-login", [
-				"Logged in (auto-refresh active).",
-				`Models: ${newModels.length} available.`,
-				'Use /model litellm/... to select.',
-			]);
-		}
+		// Pi dynamically resolves the API key via getApiKey() at request time
+		// and auto-refreshes via refreshToken() when the token nears expiry.
+		oauth: litellmLogin,
 	});
 }
