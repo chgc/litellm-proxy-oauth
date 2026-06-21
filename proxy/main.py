@@ -48,50 +48,57 @@ def validate_jwt(token: str) -> dict:
         raise PermissionError(f"Invalid token: {e}")
 
 
-# ── Per-user LiteLLM key management ───────────────────────────
+# ── Registration check (LiteLLM user with matching user_alias) ──
+
+async def _find_registered_user(username: str) -> dict | None:
+    """Look up a user in LiteLLM by user_alias.
+
+    Admin registers users via LiteLLM UI (/user/new) with
+    user_alias = Keycloak username (preferred_username).
+    Returns the user dict or None if not found.
+    """
+    async with httpx.AsyncClient() as c:
+        r = await c.get(
+            f"{LITELLM_URL}/user/list",
+            headers={"Authorization": f"Bearer {LITELLM_MASTER_KEY}"},
+        )
+        if r.status_code != 200:
+            return None
+        for user in r.json().get("users", []):
+            if user.get("user_alias") == username:
+                return user
+    return None
+
+
+# ── Per-user LiteLLM session key management ──────────────────
 
 async def _ensure_litellm_key(claims: dict) -> str:
-    """Get the LiteLLM key for this user (admin must pre-create it).
+    """Get or create a LiteLLM session key for a registered user.
 
-    Admin provisions users by creating a LiteLLM key with
-    key_alias = Keycloak username.
+    1. Check cache for existing session key.
+    2. Look up user by user_alias in LiteLLM (admin-registered).
+    3. Auto-create a virtual key for that user on first request.
+    Session key is cached in memory and blocked on logout.
     """
     user_sub = claims.get("sub", "unknown")
     username = claims.get("preferred_username", user_sub)
 
-    # Fast path: already cached from /auth/check
+    # Fast path: already have a cached session key
     cached = _key_cache.get(user_sub)
     if cached:
         return cached
 
-    # Slow path: check if admin created a key with alias = username,
-    # then create a session key (full key only returned by /key/generate)
-    authorized = False
-    async with httpx.AsyncClient() as c:
-        r = await c.get(
-            f"{LITELLM_URL}/key/list",
-            headers={"Authorization": f"Bearer {LITELLM_MASTER_KEY}"},
+    # Look up user in LiteLLM by user_alias (matches Keycloak username)
+    user = await _find_registered_user(username)
+    if not user:
+        raise PermissionError(
+            f"No LLM access for '{username}'. "
+            "Contact admin to register your account in LiteLLM."
         )
-        if r.status_code == 200:
-            for kh in r.json().get("keys", [])[:200]:
-                try:
-                    kr = await c.get(
-                        f"{LITELLM_URL}/key/info?key={kh}",
-                        headers={"Authorization": f"Bearer {LITELLM_MASTER_KEY}"},
-                    )
-                    if kr.status_code == 200:
-                        ki = kr.json()
-                        info = ki.get("info", {})
-                        if info.get("key_alias") == username:
-                            authorized = True
-                            break
-                except Exception:
-                    continue
 
-    if not authorized:
-        raise PermissionError("No LLM access. Contact admin to provision your account.")
-
-    # Create a session key (full sk-xxx returned only from /key/generate)
+    # Auto-create a standalone virtual key for this registered user
+    # We use models=[] (all models) and omit user_id so the key is not
+    # restricted by the user's model permissions (e.g. no-default-models).
     import uuid
     async with httpx.AsyncClient() as c:
         r = await c.post(
@@ -99,7 +106,7 @@ async def _ensure_litellm_key(claims: dict) -> str:
             headers={"Authorization": f"Bearer {LITELLM_MASTER_KEY}", "Content-Type": "application/json"},
             json={
                 "key_alias": f"session-{uuid.uuid4().hex[:8]}",
-                "user_id": username,
+                "models": [],
                 "max_budget": None,
             },
         )
@@ -117,15 +124,16 @@ async def _ensure_litellm_key(claims: dict) -> str:
 
 @app.get("/auth/check")
 async def auth_check(request: Request):
-    """Check if a user is authorized to use the LLM.
+    """Check if a user is registered in LiteLLM.
 
-    After Keycloak login succeeds, the client calls this endpoint
-    to verify the user has a LiteLLM account.
+    Validates JWT and looks up the user by user_alias in LiteLLM.
+    Admin registers users via LiteLLM UI (/user/new) with
+    user_alias = Keycloak username.
 
     Returns:
-      200: { authorized: true, has_key: bool, user: {...} }
+      200: { authorized: true, user: {...} }
       401: missing token
-      403: unauthorized or invalid token
+      403: unauthorized or not registered in LiteLLM
     """
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
@@ -140,50 +148,20 @@ async def auth_check(request: Request):
     user_sub = claims.get("sub", "")
     username = claims.get("preferred_username", user_sub)
 
-    # Check if a LiteLLM key exists with alias = Keycloak username
-    # Admin pre-creates keys via: /key/generate with key_alias = username
-    has_key = False
-    skey = ""
-    async with httpx.AsyncClient() as c:
-        r = await c.get(
-            f"{LITELLM_URL}/key/list",
-            headers={"Authorization": f"Bearer {LITELLM_MASTER_KEY}"},
-        )
-        if r.status_code == 200:
-            keys = r.json().get("keys", [])
-            # Check cache first
-            if user_sub in _key_cache:
-                has_key = True
-                skey = _key_cache[user_sub]
-            else:
-                # Scan LiteLLM keys for a matching alias
-                for kh in keys[:200]:
-                    try:
-                        kr = await c.get(
-                            f"{LITELLM_URL}/key/info?key={kh}",
-                            headers={"Authorization": f"Bearer {LITELLM_MASTER_KEY}"},
-                        )
-                        if kr.status_code == 200:
-                            ki = kr.json()
-                            k = ki.get("info", {})
-                            if k.get("key_alias") == username:
-                                has_key = True
-                                break
-                    except Exception:
-                        continue
-
-    if not has_key:
+    # Check if user is registered in LiteLLM (user_alias matches)
+    user = await _find_registered_user(username)
+    if not user:
         return JSONResponse(status_code=403, content={
-            "error": "No LLM access. Contact admin to provision your account.",
+            "error": f"No LLM access for '{username}'. Contact admin to register your account in LiteLLM.",
             "user": username,
         })
 
     return {
         "authorized": True,
-        "has_key": True,
         "user": {
             "sub": user_sub,
             "username": username,
+            "user_id": user["user_id"],
         },
     }
 
