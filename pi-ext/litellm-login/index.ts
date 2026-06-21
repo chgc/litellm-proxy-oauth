@@ -2,9 +2,9 @@
  * LiteLLM Login — Pi Extension
  *
  * Usage in Pi:
- *   /login-litellm    ← device flow login
- *   /logout-litellm   ← revoke session key
- *   /refresh-models   ← re-fetch model list
+ *   /login litellm      ← OAuth device flow (via pi's built-in /login)
+ *   /logout-litellm     ← revoke session key
+ *   /refresh-models     ← re-fetch model list
  *
  * Proxy URL defaults to http://localhost:4000.
  * Override with: export LLM_PROXY_URL=http://my-host:4000
@@ -59,7 +59,7 @@ const keycloakOAuthProvider: OAuthProviderInterface = {
 				if (e.message?.includes("authorization_pending")) continue;
 				if (e.message?.includes("access_denied")) throw new Error("Denied by user");
 				if (e.message?.includes("expired_token") || e.message?.includes("invalid_grant")) {
-					throw new Error("Expired. Run /login-litellm again.");
+					throw new Error("Expired. Run /login litellm again.");
 				}
 			}
 		}
@@ -95,24 +95,12 @@ const keycloakOAuthProvider: OAuthProviderInterface = {
 
 registerOAuthProvider(keycloakOAuthProvider);
 
-// ── JWT persistence (via AuthStorage, auto-refreshes OAuth tokens) ──
+// ── JWT access (via AuthStorage, auto-refreshes OAuth tokens) ──
 /** Read stored JWT from auth.json, auto-refreshing if expired. */
 async function getStoredJwt(): Promise<string | null> {
 	try {
 		return await AUTH.getApiKey("litellm") ?? null;
 	} catch { return null; }
-}
-
-/** Persist OAuth credentials (access + refresh + expiry) to auth.json. */
-function storeOAuth(accessToken: string, refreshToken: string, expiresIn: number) {
-	try {
-		AUTH.set("litellm", {
-			type: "oauth",
-			access: accessToken,
-			refresh: refreshToken,
-			expires: Date.now() + expiresIn * 1000,
-		});
-	} catch {}
 }
 
 /** Remove credentials from auth.json. */
@@ -134,61 +122,6 @@ async function apiPost(path: string, body: URLSearchParams) {
 
 async function sleep(ms: number) {
 	return new Promise((r) => setTimeout(r, ms));
-}
-
-// ── Device flow ──────────────────────────────────────────────
-interface DeviceFlowResult {
-	accessToken: string;
-	refreshToken: string;
-	expiresIn: number;
-}
-
-async function doDeviceFlow(ctx: ExtensionCommandContext): Promise<DeviceFlowResult> {
-	const d = await apiPost("/auth/device", new URLSearchParams({ client_id: CLIENT_ID }));
-
-	ctx.ui.setWidget("litellm-login", [
-		"╭─ Device Authorization ─────────────────────╮",
-		`│  Code: ${String(d.user_code).padEnd(37)}│`,
-		`│  URL:                                       │`,
-		`│  ${String(d.verification_uri_complete).padEnd(43)}│`,
-		"╰──────────────────────────────────────────────╯",
-	]);
-
-	const deadline = Date.now() + 5 * 60 * 1000;
-	let pollCount = 0;
-	while (Date.now() < deadline) {
-		await sleep((d.interval ?? 5) * 1000);
-		pollCount++;
-		ctx.ui.setWidget("litellm-login", [
-			"╭─ Device Authorization ─────────────────────╮",
-			`│  Code: ${String(d.user_code).padEnd(37)}│`,
-			`│  URL:                                       │`,
-			`│  ${String(d.verification_uri_complete).padEnd(43)}│`,
-			`│  Waiting… (poll ${pollCount})${new Array(25).fill(" ").join("")}│`,
-			"╰──────────────────────────────────────────────╯",
-		]);
-		try {
-			const t = await apiPost("/auth/token", new URLSearchParams({
-				grant_type: "urn:ietf:params:oauth:grant-type:device_code",
-				device_code: d.device_code,
-				client_id: CLIENT_ID,
-			}));
-			if (t.access_token) {
-				return {
-					accessToken: t.access_token,
-					refreshToken: t.refresh_token,
-					expiresIn: t.expires_in ?? 3600,
-				};
-			}
-		} catch (e: any) {
-			if (e.message?.includes("authorization_pending")) continue;
-			if (e.message?.includes("access_denied")) throw new Error("Denied by user");
-			if (e.message?.includes("expired_token") || e.message?.includes("invalid_grant")) {
-				throw new Error("Expired. Run /login-litellm again.");
-			}
-		}
-	}
-	throw new Error("Timed out");
 }
 
 // ── Fetch models ─────────────────────────────────────────────
@@ -231,46 +164,19 @@ export default async function (pi: ExtensionAPI) {
 	const stored = await getStoredJwt();
 	registerProvider(pi, models, stored ?? undefined);
 
-	pi.registerCommand("login-litellm", {
-		description: "Login via Keycloak device flow",
-		handler: async (_args, ctx) => {
-			try {
-				const { accessToken, refreshToken, expiresIn } = await doDeviceFlow(ctx);
-				storeOAuth(accessToken, refreshToken, expiresIn);
-
-				// Check authorization
-				const checkRes = await fetch(`${PROXY_URL}/auth/check`, {
-					headers: { Authorization: `Bearer ${accessToken}` },
-				});
-				const check = await checkRes.json();
-				if (!checkRes.ok || !check.authorized) {
-					ctx.ui.setWidget("litellm-login", [
-						`Access denied: ${check.error}`,
-						"Contact your admin to provision an LLM key.",
-					]);
-					ctx.ui.notify(`Access denied: ${check.error}`, "error");
-					clearStoredJwt();
-					return;
-				}
-
-				// Re-register with JWT
-				ctx.ui.setStatus("litellm", "Loading models…");
-				const newModels = await fetchModels();
-				registerProvider(pi, newModels, accessToken);
-				ctx.ui.setStatus("litellm", undefined);
-
-				const modelList = newModels.map((m) => `  - ${m.id}`).join("\n");
-				ctx.ui.setWidget("litellm-login", [
-					"Login successful! Available models:",
-					modelList,
-					'Use /model litellm/... to select.',
-				]);
-			} catch (e: any) {
-				const msg = String(e.message || e);
-				ctx.ui.setWidget("litellm-login", [`Error: ${msg}`]);
-				ctx.ui.notify(msg, "error");
-			}
-		},
+	// Re-register provider with fresh JWT on session start.
+	// This picks up credentials stored by /login litellm.
+	pi.on("session_start", async (_event, ctx) => {
+		const jwt = await getStoredJwt();
+		if (jwt) {
+			const newModels = await fetchModels();
+			registerProvider(pi, newModels, jwt);
+			ctx.ui.setWidget("litellm-login", [
+				"Logged in (auto-refresh active).",
+				`Models: ${newModels.length} available.`,
+				'Use /model litellm/... to select.',
+			]);
+		}
 	});
 
 	pi.registerCommand("logout-litellm", {
