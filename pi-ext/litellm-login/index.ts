@@ -9,30 +9,79 @@
  * Proxy URL defaults to http://localhost:4000.
  * Override with: export LLM_PROXY_URL=http://my-host:4000
  *
- * Credentials (Keycloak JWT) are stored in ~/.pi/agent/auth.json
- * via AuthStorage, alongside other provider credentials.
+ * Credentials (Keycloak JWT + refresh token) are stored in
+ * ~/.pi/agent/auth.json via AuthStorage as type: "oauth".
+ * AuthStorage auto-refreshes the JWT when it nears expiry.
  */
 
 import { AuthStorage, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { registerOAuthProvider, type OAuthProviderInterface } from "@earendil-works/pi-ai/oauth";
 
 const PROXY_URL = process.env.LLM_PROXY_URL ?? "http://localhost:4000";
+const CLIENT_ID = "device-flow-client";
 const AUTH = AuthStorage.create();
 
-/** Read stored JWT from pi's auth.json. */
-function getStoredJwt(): string | null {
+// ── Keycloak OAuth provider (for auto-refresh) ──────────────
+const keycloakOAuthProvider: OAuthProviderInterface = {
+	id: "litellm",
+	name: "LiteLLM (Keycloak)",
+
+	// login is handled manually via /login-litellm command
+	// (we do our own device flow UI with custom box art)
+	async login() {
+		throw new Error("Use /login-litellm command instead of /login litellm");
+	},
+
+	async refreshToken(credentials) {
+		const res = await fetch(`${PROXY_URL}/auth/token`, {
+			method: "POST",
+			headers: { "Content-Type": "application/x-www-form-urlencoded" },
+			body: new URLSearchParams({
+				grant_type: "refresh_token",
+				refresh_token: credentials.refresh,
+				client_id: CLIENT_ID,
+			}),
+		});
+		if (!res.ok) {
+			const err = await res.json().catch(() => ({}));
+			throw new Error(err.error_description ?? `Token refresh failed (${res.status})`);
+		}
+		const data = await res.json();
+		return {
+			refresh: data.refresh_token,
+			access: data.access_token,
+			expires: Date.now() + (data.expires_in ?? 3600) * 1000,
+		};
+	},
+
+	getApiKey(credentials) {
+		return credentials.access;
+	},
+};
+
+registerOAuthProvider(keycloakOAuthProvider);
+
+// ── JWT persistence (via AuthStorage, auto-refreshes OAuth tokens) ──
+/** Read stored JWT from auth.json, auto-refreshing if expired. */
+async function getStoredJwt(): Promise<string | null> {
 	try {
-		const cred = AUTH.get("litellm");
-		if (cred?.type === "api_key") return cred.key;
-	} catch { /* ignore */ }
-	return null;
+		return await AUTH.getApiKey("litellm") ?? null;
+	} catch { return null; }
 }
 
-/** Persist JWT to pi's auth.json. */
-function storeJwt(jwt: string) {
-	try { AUTH.set("litellm", { type: "api_key", key: jwt }); } catch {}
+/** Persist OAuth credentials (access + refresh + expiry) to auth.json. */
+function storeOAuth(accessToken: string, refreshToken: string, expiresIn: number) {
+	try {
+		AUTH.set("litellm", {
+			type: "oauth",
+			access: accessToken,
+			refresh: refreshToken,
+			expires: Date.now() + expiresIn * 1000,
+		});
+	} catch {}
 }
 
-/** Remove JWT from pi's auth.json. */
+/** Remove credentials from auth.json. */
 function clearStoredJwt() {
 	try { AUTH.remove("litellm"); } catch {}
 }
@@ -54,8 +103,14 @@ async function sleep(ms: number) {
 }
 
 // ── Device flow ──────────────────────────────────────────────
-async function doDeviceFlow(ctx: ExtensionCommandContext): Promise<string> {
-	const d = await apiPost("/auth/device", new URLSearchParams({ client_id: "device-flow-client" }));
+interface DeviceFlowResult {
+	accessToken: string;
+	refreshToken: string;
+	expiresIn: number;
+}
+
+async function doDeviceFlow(ctx: ExtensionCommandContext): Promise<DeviceFlowResult> {
+	const d = await apiPost("/auth/device", new URLSearchParams({ client_id: CLIENT_ID }));
 
 	ctx.ui.setWidget("litellm-login", [
 		"╭─ Device Authorization ─────────────────────╮",
@@ -82,10 +137,14 @@ async function doDeviceFlow(ctx: ExtensionCommandContext): Promise<string> {
 			const t = await apiPost("/auth/token", new URLSearchParams({
 				grant_type: "urn:ietf:params:oauth:grant-type:device_code",
 				device_code: d.device_code,
-				client_id: "device-flow-client",
+				client_id: CLIENT_ID,
 			}));
 			if (t.access_token) {
-				return t.access_token;
+				return {
+					accessToken: t.access_token,
+					refreshToken: t.refresh_token,
+					expiresIn: t.expires_in ?? 3600,
+				};
 			}
 		} catch (e: any) {
 			if (e.message?.includes("authorization_pending")) continue;
@@ -135,19 +194,19 @@ function registerProvider(pi: ExtensionAPI, models: any[], jwt?: string) {
 
 export default async function (pi: ExtensionAPI) {
 	const models = await fetchModels();
-	const stored = getStoredJwt();
+	const stored = await getStoredJwt();
 	registerProvider(pi, models, stored ?? undefined);
 
 	pi.registerCommand("login-litellm", {
 		description: "Login via Keycloak device flow",
 		handler: async (_args, ctx) => {
 			try {
-				const jwt = await doDeviceFlow(ctx);
-				storeJwt(jwt);
+				const { accessToken, refreshToken, expiresIn } = await doDeviceFlow(ctx);
+				storeOAuth(accessToken, refreshToken, expiresIn);
 
 				// Check authorization
 				const checkRes = await fetch(`${PROXY_URL}/auth/check`, {
-					headers: { Authorization: `Bearer ${jwt}` },
+					headers: { Authorization: `Bearer ${accessToken}` },
 				});
 				const check = await checkRes.json();
 				if (!checkRes.ok || !check.authorized) {
@@ -163,7 +222,7 @@ export default async function (pi: ExtensionAPI) {
 				// Re-register with JWT
 				ctx.ui.setStatus("litellm", "Loading models…");
 				const newModels = await fetchModels();
-				registerProvider(pi, newModels, jwt);
+				registerProvider(pi, newModels, accessToken);
 				ctx.ui.setStatus("litellm", undefined);
 
 				const modelList = newModels.map((m) => `  - ${m.id}`).join("\n");
@@ -186,7 +245,7 @@ export default async function (pi: ExtensionAPI) {
 			ctx.ui.setStatus("litellm", "Logging out…");
 			let isError = false;
 			try {
-				const jwt = getStoredJwt();
+				const jwt = await getStoredJwt();
 				if (jwt) {
 					const res = await fetch(`${PROXY_URL}/logout`, {
 						headers: { Authorization: `Bearer ${jwt}` },
@@ -223,7 +282,7 @@ export default async function (pi: ExtensionAPI) {
 		handler: async (_args, ctx) => {
 			ctx.ui.setStatus("litellm", "Refreshing models…");
 			const newModels = await fetchModels();
-			const stored = getStoredJwt();
+			const stored = await getStoredJwt();
 			registerProvider(pi, newModels, stored ?? undefined);
 			ctx.ui.setStatus("litellm", undefined);
 			ctx.ui.setWidget("litellm-login", [
