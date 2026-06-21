@@ -96,9 +96,9 @@ async def _ensure_litellm_key(claims: dict) -> str:
             "Contact admin to register your account in LiteLLM."
         )
 
-    # Auto-create a standalone virtual key for this registered user
-    # We use models=[] (all models) and omit user_id so the key is not
-    # restricted by the user's model permissions (e.g. no-default-models).
+    # Auto-create a virtual key bound to this registered user.
+    # user_id = Keycloak username (matches user_alias in LiteLLM).
+    # models=[] gives the key access to all models the proxy routes.
     import uuid
     async with httpx.AsyncClient() as c:
         r = await c.post(
@@ -106,6 +106,7 @@ async def _ensure_litellm_key(claims: dict) -> str:
             headers={"Authorization": f"Bearer {LITELLM_MASTER_KEY}", "Content-Type": "application/json"},
             json={
                 "key_alias": f"session-{uuid.uuid4().hex[:8]}",
+                "user_id": username,
                 "models": [],
                 "max_budget": None,
             },
@@ -196,10 +197,9 @@ async def token(request: Request):
 @app.post("/chat/completions")
 async def chat_completions(request: Request):
     auth = request.headers.get("Authorization", "")
+    token = auth.removeprefix("Bearer ")
     if not auth.startswith("Bearer "):
         return JSONResponse(status_code=401, content={"error": "Missing Bearer token"})
-
-    token = auth.removeprefix("Bearer ")
 
     # If token looks like a JWT (starts with eyJ), validate it
     if token.startswith("eyJ"):
