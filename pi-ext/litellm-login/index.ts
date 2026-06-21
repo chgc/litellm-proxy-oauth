@@ -3,8 +3,7 @@
  *
  * Usage in Pi:
  *   /login litellm      ← OAuth device flow (via pi's built-in /login)
- *   /logout-litellm     ← revoke session key
- *   /refresh-models     ← re-fetch model list
+ *   /logout litellm     ← clears auth.json credentials (built-in)
  *
  * Proxy URL defaults to http://localhost:4000.
  * Override with: export LLM_PROXY_URL=http://my-host:4000
@@ -14,7 +13,7 @@
  * AuthStorage auto-refreshes the JWT when it nears expiry.
  */
 
-import { AuthStorage, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { AuthStorage, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerOAuthProvider, type OAuthProviderInterface } from "@earendil-works/pi-ai/oauth";
 
 const PROXY_URL = process.env.LLM_PROXY_URL ?? "http://localhost:4000";
@@ -103,11 +102,6 @@ async function getStoredJwt(): Promise<string | null> {
 	} catch { return null; }
 }
 
-/** Remove credentials from auth.json. */
-function clearStoredJwt() {
-	try { AUTH.remove("litellm"); } catch {}
-}
-
 // ── Helpers ──────────────────────────────────────────────────
 async function apiPost(path: string, body: URLSearchParams) {
 	const res = await fetch(`${PROXY_URL}${path}`, {
@@ -177,58 +171,5 @@ export default async function (pi: ExtensionAPI) {
 				'Use /model litellm/... to select.',
 			]);
 		}
-	});
-
-	pi.registerCommand("logout-litellm", {
-		description: "Logout and revoke LLM access",
-		handler: async (_args, ctx) => {
-			ctx.ui.setStatus("litellm", "Logging out…");
-			let isError = false;
-			try {
-				const jwt = await getStoredJwt();
-				if (jwt) {
-					const res = await fetch(`${PROXY_URL}/logout`, {
-						headers: { Authorization: `Bearer ${jwt}` },
-						method: "POST",
-					});
-					const body = await res.json().catch(() => ({}));
-					if (body.status === "logged_out") {
-						ctx.ui.notify("Logged out.", "info");
-					} else {
-						ctx.ui.notify("Session ended.", "info");
-					}
-				} else {
-					ctx.ui.notify("No active session.", "info");
-				}
-			} catch (e: any) {
-				isError = true;
-				const msg = String(e.message || e);
-				ctx.ui.setWidget("litellm-login", [`Logout error: ${msg}`]);
-				ctx.ui.notify(`Logout: ${msg}`, "error");
-			} finally {
-				clearStoredJwt();
-				const newModels = await fetchModels();
-				registerProvider(pi, newModels);
-				if (!isError) {
-					ctx.ui.setWidget("litellm-login", undefined);
-				}
-				ctx.ui.setStatus("litellm", undefined);
-			}
-		},
-	});
-
-	pi.registerCommand("refresh-models", {
-		description: "Re-fetch model list from LiteLLM",
-		handler: async (_args, ctx) => {
-			ctx.ui.setStatus("litellm", "Refreshing models…");
-			const newModels = await fetchModels();
-			const stored = await getStoredJwt();
-			registerProvider(pi, newModels, stored ?? undefined);
-			ctx.ui.setStatus("litellm", undefined);
-			ctx.ui.setWidget("litellm-login", [
-				`Models updated (${newModels.length} available):`,
-				...newModels.map((m) => `  - ${m.id}`),
-			]);
-		},
 	});
 }
