@@ -1,0 +1,66 @@
+# ────────────────────────────────────────────────────────────────
+#  Performance test stack for the proxy
+#
+#  Runs the proxy connected to a mock server (instead of real
+#  Keycloak + LiteLLM) so we can measure pure proxy performance.
+#
+#  Usage:
+#    docker compose -f docker-compose.perf.yml up -d --build
+#    docker compose -f docker-compose.perf.yml logs -f
+#    # Run k6 tests against http://localhost:4000
+#    docker compose -f docker-compose.perf.yml down
+# ────────────────────────────────────────────────────────────────
+
+services:
+  # ── Mock server ─────────────────────────────────────────────
+  # Replaces Keycloak + LiteLLM.  Provides JWKS, JWT generation,
+  # user list, key management, and chat completions.
+  mock:
+    build: ./mock
+    ports:
+      - "9999:9999"
+    environment:
+      PORT: "9999"
+      KC_REALM: device-flow
+      # Issuer must match what the proxy expects for JWT validation
+      KC_ISSUER: "http://mock:9999/realms/device-flow"
+      MAX_USERS: "500"
+      # Simulated latency in ms for downstream calls
+      LITELLM_DELAY_MS: "5"
+      KC_DELAY_MS: "10"
+    healthcheck:
+      test: [ "CMD-SHELL", "python -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:9999/health\")'" ]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+    networks:
+      - perf-net
+
+  # ── Proxy under test ────────────────────────────────────────
+  proxy:
+    build: ../../proxy
+    ports:
+      - "4000:4000"
+    depends_on:
+      mock:
+        condition: service_healthy
+    environment:
+      PROXY_PORT: "4000"
+      KC_URL: "http://mock:9999"
+      KC_REALM: device-flow
+      KC_ISSUER: "http://mock:9999/realms/device-flow"
+      LITELLM_URL: "http://mock:9999"
+      LITELLM_MASTER_KEY: sk-litellm-master-key-change-me
+    healthcheck:
+      test: [ "CMD-SHELL", "python -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:4000/health\")'" ]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+    networks:
+      - perf-net
+
+networks:
+  perf-net:
+    driver: bridge
