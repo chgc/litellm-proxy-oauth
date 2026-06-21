@@ -1,17 +1,22 @@
 # Usage Flow
 
-## Admin: provision a user
+## Admin: Register a user in LiteLLM
+
+Admin creates a user in LiteLLM admin UI (`http://localhost:4001`) or via API:
 
 ```bash
-curl -X POST http://localhost:4001/key/generate \
+curl -X POST http://localhost:4001/user/new \
   -H "Authorization: Bearer $MASTER_KEY" \
+  -H "Content-Type: application/json" \
   -d '{
-    "key_alias": "testuser",
-    "max_budget": 50.0,
+    "user_alias": "jkyangc",
+    "user_email": "user@example.com",
+    "models": []
   }'
 ```
 
-Key must have `key_alias` matching the Keycloak username (`preferred_username` claim).
+`user_alias` must match the Keycloak username (`preferred_username` claim).
+`models: []` gives access to all models the proxy routes.
 
 ---
 
@@ -50,11 +55,11 @@ sequenceDiagram
 
     C->>P: GET /auth/check (Bearer JWT)
     P->>P: Validate JWT
-    P->>L: Scan keys for alias = username
-    alt Key exists
+    P->>L: GET /user/list → find user_alias == username
+    alt User exists
         L-->>P: found
         P-->>C: authorized: true
-    else No key
+    else Not registered
         L-->>P: not found
         P-->>C: 403 No LLM access
     end
@@ -63,14 +68,15 @@ sequenceDiagram
 
     C->>P: POST /v1/chat/completions (Bearer JWT)
     P->>P: Validate JWT
-    P->>L: Check admin key still exists
-    L-->>P: confirmed
+    P->>L: GET /user/list → confirm user exists
+    L-->>P: registered user
     P->>L: POST /key/generate (session key)
+    Note right of P: user_id = username<br/>models = [] (all)<br/>key_alias = session-{uuid}
     L-->>P: sk-xxx (full key)
-    P->>P: Cache in memory
+    P->>P: Cache in memory (by JWT sub)
 
-    P->>L: POST /chat (Bearer sk-xxx)
-    L->>O: POST /chat
+    P->>L: POST /v1/chat/completions (Bearer sk-xxx)
+    L->>O: forward to LLM provider
     O-->>L: Response
     L-->>P: Response
     P-->>C: Response
@@ -78,13 +84,26 @@ sequenceDiagram
     Note over U,O: SUBSEQUENT REQUESTS
 
     C->>P: POST /v1/chat/completions (Bearer JWT)
-    P->>P: Validate JWT
     P->>P: Cache hit, reuse sk-xxx
-    P->>L: POST /chat (Bearer sk-xxx)
-    L->>O: POST /chat
+    P->>L: POST /v1/chat/completions (Bearer sk-xxx)
+    L->>O: forward
     O-->>L: Response
     L-->>P: Response
     P-->>C: Response
+```
+
+---
+
+## Stale Key Recovery
+
+If the session key is manually deleted from LiteLLM admin UI:
+
+```
+chat request → cache hit (stale key) → LiteLLM returns 401
+    → proxy clears cache
+    → re-validates user registration (user_alias check)
+    → creates new session key
+    → retries request → 200 OK
 ```
 
 ---
@@ -94,13 +113,28 @@ sequenceDiagram
 | Token | Source | Expiry | Notes |
 |-------|--------|--------|-------|
 | Keycloak JWT | Device flow | 1 hour | Auto-refreshed by extension |
-| Admin key (alias = username) | Admin `/key/generate` | Permanent | Authorization only, not used for requests |
-| Session key (sk-xxx) | Proxy on first request | Session lifetime | Cached in proxy memory, full key for API calls |
+| LiteLLM user (user_alias) | Admin `/user/new` | Permanent | Registration only, maps to Keycloak username |
+| Session key (sk-xxx) | Proxy on first request | Until blocked | Cached in proxy memory, bound to `user_id = username` |
 
 ## Permission checks
 
 | Point | What happens | If denied |
 |-------|-------------|-----------|
-| `/auth/check` | Proxy scans LiteLLM for key with `key_alias = username` | `403 No LLM access. Contact admin.` |
+| `/auth/check` | Proxy looks up user by `user_alias` in `/user/list` | `403 No LLM access. Contact admin to register your account.` |
 | Chat request | Proxy verifies JWT signature locally (JWKS) | `403 Invalid token` |
+| First chat / key create | Proxy re-checks user registration | `403 No LLM access` |
+| Stale key recovery | Proxy re-checks user registration | `403 No LLM access` (user deleted from LiteLLM) |
 | LiteLLM per request | LiteLLM checks budget and rate limits | `429 Budget exceeded` |
+
+## API Endpoints
+
+| Endpoint | Method | Auth | Description |
+|----------|--------|------|-------------|
+| `/auth/device` | POST | None | Keycloak device authorization |
+| `/auth/token` | POST | None | Keycloak token polling |
+| `/auth/check` | GET | Bearer JWT | Validate JWT + check user registration |
+| `/v1/chat/completions` | POST | Bearer JWT | Chat via proxy → LiteLLM |
+| `/chat/completions` | POST | Bearer JWT | Same as above (alternative path) |
+| `/v1/models` | GET | Master key | List models from LiteLLM |
+| `/logout` | POST | Bearer JWT | Block session key |
+| `/health` | GET | None | Health check |
