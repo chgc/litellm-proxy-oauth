@@ -82,7 +82,6 @@ async def _ensure_litellm_key(claims: dict) -> str:
     """
     user_sub = claims.get("sub", "unknown")
     username = claims.get("preferred_username", user_sub)
-
     # Fast path: already have a cached session key
     cached = _key_cache.get(user_sub)
     if cached:
@@ -218,7 +217,18 @@ async def chat_completions(request: Request):
         }
         async with httpx.AsyncClient(timeout=120) as c:
             r = await c.post(f"{LITELLM_URL}/v1/chat/completions", content=body, headers=headers)
-            return Response(content=r.content, status_code=r.status_code, media_type="application/json")
+
+        # If LiteLLM rejects the key (deleted/blocked from admin UI),
+        # clear cache and retry once with a fresh key.
+        if r.status_code == 401:
+            # Stale key — remove from cache and create a new one
+            _key_cache.pop(claims.get("sub", ""), None)
+            user_key = await _ensure_litellm_key(claims)
+            headers["Authorization"] = f"Bearer {user_key}"
+            async with httpx.AsyncClient(timeout=120) as c2:
+                r = await c2.post(f"{LITELLM_URL}/v1/chat/completions", content=body, headers=headers)
+
+        return Response(content=r.content, status_code=r.status_code, media_type="application/json")
 
     # Non-JWT: not authenticated
     return JSONResponse(status_code=403, content={"error": "Not authenticated. Run /login-litellm first."})
