@@ -8,25 +8,33 @@
  *
  * Proxy URL defaults to http://localhost:4000.
  * Override with: export LLM_PROXY_URL=http://my-host:4000
+ *
+ * Credentials (Keycloak JWT) are stored in ~/.pi/agent/auth.json
+ * via AuthStorage, alongside other provider credentials.
  */
 
-import { readFileSync, writeFileSync, unlinkSync, existsSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { AuthStorage, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 
 const PROXY_URL = process.env.LLM_PROXY_URL ?? "http://localhost:4000";
-const STORE_PATH = join(homedir(), ".litellm-jwt");
+const AUTH = AuthStorage.create();
 
-// ── JWT persistence ─────────────────────────────────────────
-function storeJwt(jwt: string) {
-	try { writeFileSync(STORE_PATH, jwt, "utf-8"); } catch {}
-}
+/** Read stored JWT from pi's auth.json. */
 function getStoredJwt(): string | null {
-	try { return readFileSync(STORE_PATH, "utf-8").trim() || null; } catch { return null; }
+	try {
+		const cred = AUTH.get("litellm");
+		if (cred?.type === "api_key") return cred.key;
+	} catch { /* ignore */ }
+	return null;
 }
+
+/** Persist JWT to pi's auth.json. */
+function storeJwt(jwt: string) {
+	try { AUTH.set("litellm", { type: "api_key", key: jwt }); } catch {}
+}
+
+/** Remove JWT from pi's auth.json. */
 function clearStoredJwt() {
-	try { if (existsSync(STORE_PATH)) unlinkSync(STORE_PATH); } catch {}
+	try { AUTH.remove("litellm"); } catch {}
 }
 
 // ── Helpers ──────────────────────────────────────────────────
